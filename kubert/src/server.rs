@@ -80,6 +80,14 @@ pub enum Error {
     LocalAddr(#[source] std::io::Error),
 }
 
+#[derive(Clone, Debug)]
+struct Server<S> {
+    cert: TlsCertPath,
+    key: TlsKeyPath,
+    drain: drain::Watch,
+    service: S,
+}
+
 // === impl ServerArgs ===
 
 impl ServerArgs {
@@ -93,22 +101,28 @@ impl ServerArgs {
     /// kubernetes admission controllers.
     pub async fn spawn<S, B>(self, service: S, drain: drain::Watch) -> Result<SpawnedServer, Error>
     where
-        S: Service<hyper::Request<hyper::Body>, Response = hyper::Response<B>>
-            + Clone
-            + Send
-            + 'static,
+        S: Service<hyper::Request<hyper::Body>, Response = hyper::Response<B>>,
+        S: Clone + Send + Sync + 'static,
         S::Error: std::error::Error + Send + Sync,
         S::Future: Send,
         B: hyper::body::HttpBody + Send + 'static,
         B::Data: Send,
         B::Error: std::error::Error + Send + Sync,
     {
-        let tls_key = self.server_tls_key.ok_or(Error::NoTlsKey)?;
-        let tls_certs = self.server_tls_certs.ok_or(Error::NoTlsCerts)?;
+        let srv = {
+            let key = self.server_tls_key.ok_or(Error::NoTlsKey)?;
+            let cert = self.server_tls_certs.ok_or(Error::NoTlsCerts)?;
+            Server {
+                key,
+                cert,
+                drain,
+                service,
+            }
+        };
 
         // Ensure the TLS key and certificate files load properly before binding the socket and
         // spawning the server.
-        let _ = load_tls(&tls_key, &tls_certs).await?;
+        let _ = srv.load_tls().await?;
 
         let tcp = TcpListener::bind(&self.server_addr)
             .await
@@ -116,7 +130,7 @@ impl ServerArgs {
         let local_addr = tcp.local_addr().map_err(Error::LocalAddr)?;
 
         let task = tokio::spawn(
-            accept_loop(tcp, drain, service, tls_key, tls_certs)
+            srv.accept_loop(tcp)
                 .instrument(info_span!("server", port = %local_addr.port())),
         );
 
@@ -143,124 +157,109 @@ impl SpawnedServer {
     }
 }
 
-async fn accept_loop<S, B>(
-    tcp: TcpListener,
-    drain: drain::Watch,
-    service: S,
-    tls_key: TlsKeyPath,
-    tls_certs: TlsCertPath,
-) where
-    S: Service<hyper::Request<hyper::Body>, Response = hyper::Response<B>> + Clone + Send + 'static,
+impl<S, B> Server<S>
+where
+    S: Service<hyper::Request<hyper::Body>, Response = hyper::Response<B>>,
+    S: Clone + Send + Sync + 'static,
     S::Error: std::error::Error + Send + Sync,
     S::Future: Send,
     B: hyper::body::HttpBody + Send + 'static,
     B::Data: Send,
     B::Error: std::error::Error + Send + Sync,
 {
-    loop {
-        // Wait for the shutdown to be signaled or for the next connection to be accepted.
-        let socket = tokio::select! {
-            biased;
+    async fn accept_loop(self, tcp: TcpListener) {
+        loop {
+            // Wait for the shutdown to be signaled or for the next connection to be accepted.
+            let socket = tokio::select! {
+                biased;
 
-            release = drain.clone().signaled() => {
-                drop(release);
-                return;
-            }
+                release = self.drain.clone().signaled() => {
+                    drop(release);
+                    return;
+                }
 
-            res = tcp.accept() => match res {
-                Ok((socket, _)) => socket,
+                res = tcp.accept() => match res {
+                    Ok((socket, _)) => socket,
+                    Err(error) => {
+                        error!(%error, "Failed to accept connection");
+                        continue;
+                    }
+                },
+            };
+
+            let client_addr = match socket.peer_addr() {
+                Ok(addr) => addr,
                 Err(error) => {
-                    error!(%error, "Failed to accept connection");
+                    error!(%error, "Failed to get peer address");
                     continue;
                 }
-            },
-        };
+            };
+            tokio::spawn(
+                self.clone()
+                    .serve_conn(socket)
+                    .instrument(info_span!("conn", client.ip = %client_addr.ip())),
+            );
+        }
+    }
 
-        let client_addr = match socket.peer_addr() {
-            Ok(addr) => addr,
+    async fn serve_conn(self, tcp: TcpStream) {
+        // Reload the TLS credentials for each connection.
+        let tls = match self.load_tls().await {
+            Ok(tls) => tls,
             Err(error) => {
-                error!(%error, "Failed to get peer address");
-                continue;
+                info!(%error, "Connection failed");
+                return;
             }
         };
-        tokio::spawn(
-            serve_conn(
-                socket,
-                drain.clone(),
-                service.clone(),
-                tls_key.clone(),
-                tls_certs.clone(),
-            )
-            .instrument(info_span!("conn", client.ip = %client_addr.ip())),
-        );
+
+        let socket = match tls.accept(tcp).await {
+            Ok(s) => s,
+            Err(error) => {
+                info!(%error, "TLS handshake failed");
+                return;
+            }
+        };
+
+        // Serve the HTTP connection and wait for the drain signal. If a drain is
+        // signaled, tell the HTTP connection to terminate gracefully when in-flight
+        // requests have completed.
+        let mut conn = hyper::server::conn::Http::new().serve_connection(socket, self.service);
+        let res = tokio::select! {
+            biased;
+            res = &mut conn => res,
+            release = self.drain.signaled() => {
+                Pin::new(&mut conn).graceful_shutdown();
+                release.release_after(conn).await
+            }
+        };
+        match res {
+            Ok(()) => debug!("Connection closed"),
+            Err(error) => info!(%error, "Connection lost"),
+        }
     }
-}
 
-async fn serve_conn<S, B>(
-    tcp: TcpStream,
-    drain: drain::Watch,
-    service: S,
-    tls_key: TlsKeyPath,
-    tls_certs: TlsCertPath,
-) where
-    S: Service<hyper::Request<hyper::Body>, Response = hyper::Response<B>> + Send + 'static,
-    S::Error: std::error::Error + Send + Sync,
-    S::Future: Send,
-    B: hyper::body::HttpBody + Send + 'static,
-    B::Data: Send,
-    B::Error: std::error::Error + Send + Sync,
-{
-    // Reload the TLS credentials for each connection.
-    let tls = match load_tls(&tls_key, &tls_certs).await {
-        Ok(tls) => tls,
-        Err(error) => {
-            info!(%error, "Connection failed");
-            return;
-        }
-    };
+    async fn load_tls(&self) -> Result<TlsAcceptor, Error> {
+        let key = self
+            .key
+            .load_private_key()
+            .await
+            .map_err(Error::TlsKeyReadError)?;
 
-    let socket = match tls.accept(tcp).await {
-        Ok(s) => s,
-        Err(error) => {
-            info!(%error, "TLS handshake failed");
-            return;
-        }
-    };
+        let certs = self
+            .cert
+            .load_certs()
+            .await
+            .map_err(Error::TlsCertsReadError)?;
 
-    // Serve the HTTP connection and wait for the drain signal. If a drain is
-    // signaled, tell the HTTP connection to terminate gracefully when in-flight
-    // requests have completed.
-    let mut conn = hyper::server::conn::Http::new().serve_connection(socket, service);
-    let res = tokio::select! {
-        biased;
-        res = &mut conn => res,
-        release = drain.signaled() => {
-            Pin::new(&mut conn).graceful_shutdown();
-            release.release_after(conn).await
-        }
-    };
-    match res {
-        Ok(()) => debug!("Connection closed"),
-        Err(error) => info!(%error, "Connection lost"),
+        let mut cfg = rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(Error::InvalidTlsCredentials)?;
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        Ok(TlsAcceptor::from(Arc::new(cfg)))
     }
-}
-
-async fn load_tls(pk: &TlsKeyPath, crts: &TlsCertPath) -> Result<TlsAcceptor, Error> {
-    let key = pk
-        .load_private_key()
-        .await
-        .map_err(Error::TlsKeyReadError)?;
-
-    let certs = crts.load_certs().await.map_err(Error::TlsCertsReadError)?;
-
-    let mut cfg = rustls::ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(Error::InvalidTlsCredentials)?;
-    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
-    Ok(TlsAcceptor::from(Arc::new(cfg)))
 }
 
 // === impl TlsCertPath ===
